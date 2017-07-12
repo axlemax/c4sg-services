@@ -4,7 +4,9 @@ import static java.util.Objects.requireNonNull;
 
 import java.sql.Timestamp;
 import java.util.Calendar;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.c4sg.dao.OrganizationDAO;
 import org.c4sg.dao.ProjectDAO;
@@ -24,13 +26,17 @@ import org.c4sg.exception.ProjectServiceException;
 import org.c4sg.exception.UserProjectException;
 import org.c4sg.mapper.ProjectMapper;
 import org.c4sg.service.AsyncEmailService;
+import org.c4sg.service.C4sgUrlService;
 import org.c4sg.service.ProjectService;
+import org.c4sg.service.SkillService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.data.domain.Pageable;
+import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
+import org.springframework.util.StringUtils;
 
 @Service
 public class ProjectServiceImpl implements ProjectService {
@@ -40,7 +46,7 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Autowired
     private UserDAO userDAO;
-
+    
     @Autowired
     private UserProjectDAO userProjectDAO;
     
@@ -49,6 +55,9 @@ public class ProjectServiceImpl implements ProjectService {
 
     @Autowired
     private ProjectMapper projectMapper;
+    
+    @Autowired
+    private SkillService skillService;
 
     @Autowired
     private AsyncEmailService asyncEmailService;
@@ -56,10 +65,12 @@ public class ProjectServiceImpl implements ProjectService {
     @Autowired
     private OrganizationDAO organizationDAO;
     
+    @Autowired
+    private C4sgUrlService urlService;
+    
     private static final String FROM_EMAIL = "info@code4socialgood.org";
     private static final String SUBJECT_ORGANIZATION = "You received an application from Code for Social Good";
-    private static final String BODY_ORGANIZATION= "You received an application from Code for Social Good. " 
-    				+ "Please login to the dashboard to review the application.";
+    private static final String BODY_ORGANIZATION= "You received an application from Code for Social Good. Please login to the dashboard to review the application.";
     private static final String SUBJECT_NOTIFICATION = "Code for Social Good: New Project Notification";
     private static final String BODY_NOTIIFCATION= "You have registered to recieve notification on new projects.\n" 
     				+ "The following new project has been created:\n" + "http://dev.code4socialgood.org/project/view/";
@@ -116,6 +127,19 @@ public class ProjectServiceImpl implements ProjectService {
     @Override
     public List<ProjectDTO> findByOrganization(Integer orgId, String projectStatus) {
         List<Project> projects = projectDAO.getProjectsByOrganization(orgId, projectStatus);
+        
+        // There should always be a new project for an organization. If new project doesn't exist, create one
+        if (projectStatus != null && projectStatus.equals("N")) {
+        	if ((projects == null) || projects.size() == 0) {        		
+            	Project project = new Project();
+            	project.setOrganization(organizationDAO.findOne(orgId));
+            	project.setRemoteFlag("Y");
+            	project.setStatus("N");        	
+            	projectDAO.save(project);
+            	projects = projectDAO.getProjectsByOrganization(orgId, projectStatus);
+        	}
+        }
+        
         return projectMapper.getDtosFromEntities(projects);
     }
 
@@ -201,14 +225,39 @@ public class ProjectServiceImpl implements ProjectService {
 		return projectMapper.getJobTitleDtosFromEntities(jobTitles);
 	}
     
+	@Async
     private void apply(User user, Project project) {
 
         Integer orgId = project.getOrganization().getId();
         List<User> users = userDAO.findByOrgId(orgId);
-        if (users != null) {
-        	String orgEmail = userDAO.findByOrgId(orgId).get(0).getEmail();
-        	asyncEmailService.send(FROM_EMAIL, orgEmail, SUBJECT_ORGANIZATION, BODY_ORGANIZATION);
-        	System.out.println("Application email sent: Project=" + project.getId() + " ; Applicant=" + user.getId() + " ; OrgEmail=" + orgEmail);
+        if (users != null && !users.isEmpty()) {
+        	
+        	List<String> userSkills = skillService.findSkillsForUser(user.getId());
+        	User orgUser = users.get(0);
+        	
+        	// send organization email
+			if (!StringUtils.isEmpty(user.getEmail())) {
+				Map<String, Object> mailContext = new HashMap<String, Object>();
+				mailContext.put("user", user);
+				mailContext.put("skills", userSkills);
+				mailContext.put("project", project);
+				mailContext.put("message", BODY_ORGANIZATION);
+				asyncEmailService.sendWithContext(FROM_EMAIL, user.getEmail(), SUBJECT_ORGANIZATION, "volunteer-application", mailContext);
+			}
+        	
+        	// send applicant email
+        	Organization org = organizationDAO.findOne(project.getOrganization().getId());
+        	if(org != null) {
+        		String subject = "Your C4SG Application was created";
+            	Map<String, Object> appCtx = new HashMap<String, Object>();
+            	appCtx.put("org", org);
+            	appCtx.put("user", orgUser);
+            	appCtx.put("projectLink", urlService.getProjectUrl(project.getId()));
+            	appCtx.put("project", project);
+            	asyncEmailService.sendWithContext(FROM_EMAIL, user.getEmail(), subject, "applicant-application", appCtx);
+        	}
+        	
+        	System.out.println("Application email sent: Project=" + project.getId() + " ; Applicant=" + user.getId() + " ; OrgEmail=" + orgUser.getEmail());
         }
     }
         
@@ -228,6 +277,7 @@ public class ProjectServiceImpl implements ProjectService {
     
 	@Override
 	public void saveImage(Integer id, String imgUrl) {
+				
 		projectDAO.updateImage(imgUrl, id);
 	}
 }
